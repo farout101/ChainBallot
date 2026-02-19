@@ -1,6 +1,6 @@
 # Blockchain Voting (Ganache + Truffle + React)
 
-A simple local blockchain voting app with a Truffle smart contract and a React frontend.
+A local blockchain voting app with a Truffle smart contract and a React frontend. Admins configure the poll and whitelist voter addresses. Voters cast a single vote per election using their MetaMask account.
 
 ## Prerequisites
 
@@ -12,6 +12,15 @@ A simple local blockchain voting app with a Truffle smart contract and a React f
 
 - truffle-dVoting: Solidity contract, migrations, and build artifacts
 - react-dVoting: React + Vite frontend
+
+## Features
+
+- Admin-configured poll title and choices
+- Address-based whitelist (MetaMask accounts) with add/remove controls
+- One vote per address per election, enforced on-chain
+- Start/end election lifecycle with on-chain timestamps
+- Results view with current leader and tie detection
+- Activity log from contract events
 
 ## Installation
 
@@ -68,10 +77,11 @@ Open the URL shown by Vite (usually http://localhost:5173).
 ## Usage Flow
 
 1) Connect MetaMask in the app.
-2) Admin (deployer account) starts the election and manages candidates.
-3) Admin whitelists voters (single or batch).
-4) Whitelisted voters can vote once while the election is active.
-5) Results and activity log update from on-chain data.
+2) Admin (deployer account) sets poll title and choices while the election is inactive.
+3) Admin sets the whitelist of voter addresses (and can remove addresses while inactive).
+4) Admin starts the election.
+5) Whitelisted voters switch MetaMask accounts and vote once during the election.
+6) Admin ends the election to lock in results. Next election starts fresh with a new vote round.
 
 ## App Pages
 
@@ -79,8 +89,16 @@ Open the URL shown by Vite (usually http://localhost:5173).
 - /admin: Admin console
 - /results: Results and activity log
 
+## Business Rules
+
+- Only the deployer account can manage the election.
+- Admin actions (title, choices, whitelist changes) are only allowed while the election is inactive.
+- Each whitelisted address can vote once per election.
+- Starting a new election resets vote totals and vote eligibility.
+
 ## Troubleshooting
 
 - Wrong network: switch MetaMask to Ganache (chain id 5777 or 1337).
 - ABI mismatch: re-run compile + migrate and restart the frontend.
 - Account not changing: disconnect the site in MetaMask and reconnect, or use the Reconnect button.
+- Internal JSON-RPC error: usually a reverted transaction (wrong election state or invalid inputs).

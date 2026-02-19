@@ -7,28 +7,28 @@ contract Voting {
     uint256 public electionStart;
     uint256 public electionEnd;
     string public pollTitle;
+    uint256 public electionId;
 
     struct Choice {
         string label;
         uint256 votes;
     }
 
-    struct Voter {
-        string name;
-        bool voted;
-        uint256 choiceIndex;
-        uint256 votedAt;
-    }
-
     Choice[] private choices;
-    Voter[] private voters;
+    address[] private whitelistAddresses;
+    mapping(address => bool) public isWhitelisted;
+    mapping(address => uint256) public lastVotedElection;
+    mapping(address => uint256) public lastVotedChoice;
+    mapping(address => uint256) public lastVotedAt;
 
     event PollTitleSet(string title);
     event ChoicesSet(uint256 count);
-    event VotersSet(uint256 count);
+    event WhitelistSet(uint256 count);
+    event WhitelistAdded(address indexed voter);
+    event WhitelistRemoved(address indexed voter);
     event ElectionStarted(uint256 startTime);
     event ElectionEnded(uint256 endTime);
-    event VoteCast(uint256 indexed voterIndex, uint256 indexed choiceIndex);
+    event VoteCast(address indexed voter, uint256 indexed choiceIndex);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner");
@@ -64,21 +64,41 @@ contract Voting {
         emit ChoicesSet(labels.length);
     }
 
-    function setVoters(string[] calldata names) external onlyOwner onlyWhenInactive {
-        require(names.length > 0, "No voters");
-        delete voters;
-        for (uint256 i = 0; i < names.length; i++) {
-            require(bytes(names[i]).length > 0, "Empty voter");
-            voters.push(Voter({name: names[i], voted: false, choiceIndex: 0, votedAt: 0}));
+    function setWhitelist(address[] calldata voters) external onlyOwner onlyWhenInactive {
+        require(voters.length > 0, "No voters");
+        _clearWhitelist();
+        for (uint256 i = 0; i < voters.length; i++) {
+            address voter = voters[i];
+            require(voter != address(0), "Invalid voter");
+            if (!isWhitelisted[voter]) {
+                isWhitelisted[voter] = true;
+                whitelistAddresses.push(voter);
+            }
         }
-        _resetVotes();
-        emit VotersSet(names.length);
+        emit WhitelistSet(voters.length);
+    }
+
+    function addToWhitelist(address voter) external onlyOwner onlyWhenInactive {
+        require(voter != address(0), "Invalid voter");
+        if (!isWhitelisted[voter]) {
+            isWhitelisted[voter] = true;
+            whitelistAddresses.push(voter);
+            emit WhitelistAdded(voter);
+        }
+    }
+
+    function removeFromWhitelist(address voter) external onlyOwner onlyWhenInactive {
+        require(isWhitelisted[voter], "Not whitelisted");
+        isWhitelisted[voter] = false;
+        emit WhitelistRemoved(voter);
     }
 
     function startElection() external onlyOwner {
         require(!electionActive, "Election already active");
         require(choices.length > 0, "No choices");
-        require(voters.length > 0, "No voters");
+        require(_activeWhitelistCount() > 0, "No voters");
+        _resetVotes();
+        electionId += 1;
         electionActive = true;
         electionStart = block.timestamp;
         electionEnd = 0;
@@ -92,18 +112,17 @@ contract Voting {
         emit ElectionEnded(electionEnd);
     }
 
-    function vote(uint256 voterIndex, uint256 choiceIndex) external onlyWhileActive {
-        require(voterIndex < voters.length, "Invalid voter");
+    function vote(uint256 choiceIndex) external onlyWhileActive {
         require(choiceIndex < choices.length, "Invalid choice");
-        Voter storage voter = voters[voterIndex];
-        require(!voter.voted, "Already voted");
+        require(isWhitelisted[msg.sender], "Not whitelisted");
+        require(lastVotedElection[msg.sender] < electionId, "Already voted");
 
-        voter.voted = true;
-        voter.choiceIndex = choiceIndex;
-        voter.votedAt = block.timestamp;
+        lastVotedElection[msg.sender] = electionId;
+        lastVotedChoice[msg.sender] = choiceIndex;
+        lastVotedAt[msg.sender] = block.timestamp;
         choices[choiceIndex].votes += 1;
 
-        emit VoteCast(voterIndex, choiceIndex);
+        emit VoteCast(msg.sender, choiceIndex);
     }
 
     function choiceCount() external view returns (uint256) {
@@ -120,18 +139,28 @@ contract Voting {
         return (choice.label, choice.votes);
     }
 
-    function voterCount() external view returns (uint256) {
-        return voters.length;
+    function whitelistCount() external view returns (uint256) {
+        return whitelistAddresses.length;
     }
 
-    function voterInfo(uint256 voterIndex)
+    function whitelistEntry(uint256 index) external view returns (address voter, bool active) {
+        require(index < whitelistAddresses.length, "Invalid voter");
+        address addr = whitelistAddresses[index];
+        return (addr, isWhitelisted[addr]);
+    }
+
+    function voterStatus(address voter)
         external
         view
-        returns (string memory name, bool voted, uint256 choiceIndex, uint256 votedAt)
+        returns (bool whitelisted, bool voted, uint256 choiceIndex, uint256 votedAt)
     {
-        require(voterIndex < voters.length, "Invalid voter");
-        Voter memory voter = voters[voterIndex];
-        return (voter.name, voter.voted, voter.choiceIndex, voter.votedAt);
+        bool votedThisElection = lastVotedElection[voter] == electionId;
+        return (
+            isWhitelisted[voter],
+            votedThisElection,
+            votedThisElection ? lastVotedChoice[voter] : 0,
+            votedThisElection ? lastVotedAt[voter] : 0
+        );
     }
 
     function getWinner()
@@ -167,5 +196,25 @@ contract Voting {
         for (uint256 i = 0; i < choices.length; i++) {
             choices[i].votes = 0;
         }
+    }
+
+    function _clearWhitelist() internal {
+        for (uint256 i = 0; i < whitelistAddresses.length; i++) {
+            address addr = whitelistAddresses[i];
+            if (isWhitelisted[addr]) {
+                isWhitelisted[addr] = false;
+            }
+        }
+        delete whitelistAddresses;
+    }
+
+    function _activeWhitelistCount() internal view returns (uint256) {
+        uint256 count = 0;
+        for (uint256 i = 0; i < whitelistAddresses.length; i++) {
+            if (isWhitelisted[whitelistAddresses[i]]) {
+                count += 1;
+            }
+        }
+        return count;
     }
 }

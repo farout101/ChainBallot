@@ -51,6 +51,11 @@
   gap: 1rem;
 }
 
+.results-stack {
+  display: grid;
+  gap: 1.5rem;
+}
+
 .card-panel {
   background: #ffffff;
   border-radius: 20px;
@@ -85,6 +90,8 @@
 .stat-value {
   font-weight: 600;
   color: #111827;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .stat-helper {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import Web3 from 'web3'
 import VotingArtifact from '../../truffle-dVoting/build/contracts/Voting.json'
@@ -10,9 +10,12 @@ const FALLBACK_CONTRACT_ADDRESS =
 
 function getDeployedAddress() {
   const networks = VotingArtifact.networks || {}
+  const knownIds = GANACHE_NETWORK_IDS.map((id) => String(id))
+  const matchingKey = Object.keys(networks).find((key) =>
+    knownIds.includes(String(key)),
+  )
   return (
-    networks[GANACHE_NETWORK_IDS[0]]?.address ||
-    networks[String(GANACHE_NETWORK_IDS[0])]?.address ||
+    (matchingKey ? networks[matchingKey]?.address : '') ||
     FALLBACK_CONTRACT_ADDRESS
   )
 }
@@ -47,35 +50,42 @@ function App() {
   const [account, setAccount] = useState('')
   const [networkId, setNetworkId] = useState(null)
   const [owner, setOwner] = useState('')
+  const [pollTitle, setPollTitle] = useState('')
+  const [pollTitleInput, setPollTitleInput] = useState('')
   const [electionActive, setElectionActive] = useState(false)
   const [electionStart, setElectionStart] = useState(null)
   const [electionEnd, setElectionEnd] = useState(null)
+  const [choices, setChoices] = useState([])
+  const [whitelist, setWhitelist] = useState([])
+  const [selectedChoiceIndex, setSelectedChoiceIndex] = useState('')
+  const [choicesInput, setChoicesInput] = useState('')
+  const [whitelistInput, setWhitelistInput] = useState('')
+  const [removeWhitelistAddress, setRemoveWhitelistAddress] = useState('')
   const [isWhitelisted, setIsWhitelisted] = useState(false)
   const [hasVoted, setHasVoted] = useState(false)
-  const [votedCandidateIndex, setVotedCandidateIndex] = useState(null)
+  const [votedChoiceIndex, setVotedChoiceIndex] = useState(null)
   const [votedAt, setVotedAt] = useState(null)
-  const [candidates, setCandidates] = useState([])
-  const [selectedCandidate, setSelectedCandidate] = useState('')
-  const [whitelistAddress, setWhitelistAddress] = useState('')
-  const [whitelistBatch, setWhitelistBatch] = useState('')
-  const [newCandidateName, setNewCandidateName] = useState('')
-  const [removeCandidateId, setRemoveCandidateId] = useState('')
   const [winner, setWinner] = useState(null)
   const [events, setEvents] = useState([])
+  const [eventWarning, setEventWarning] = useState('')
   const [status, setStatus] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
+  const contractRef = useRef(null)
+
   const deployedAddress = useMemo(() => getDeployedAddress(), [])
 
-  const loadEvents = async (activeContract) => {
-    if (!activeContract) {
+  const loadEvents = async (activeContract, web3Instance) => {
+    if (!activeContract || !web3Instance) {
       return
     }
 
     try {
+      const latestBlock = await web3Instance.eth.getBlockNumber()
+      const fromBlock = Math.max(0, Number(latestBlock) - 2000)
       const pastEvents = await activeContract.getPastEvents('allEvents', {
-        fromBlock: 0,
+        fromBlock,
         toBlock: 'latest',
       })
 
@@ -84,18 +94,22 @@ function App() {
           const id = `${event.transactionHash}-${event.logIndex}`
           const summary = (() => {
             switch (event.event) {
-              case 'Whitelisted':
+              case 'PollTitleSet':
+                return `Poll title set: ${event.returnValues.title}`
+              case 'ChoicesSet':
+                return `Choices updated (${event.returnValues.count})`
+              case 'WhitelistSet':
+                return `Whitelist updated (${event.returnValues.count})`
+              case 'WhitelistAdded':
                 return `Whitelisted ${formatAddress(event.returnValues.voter)}`
-              case 'CandidateAdded':
-                return `Candidate added: ${event.returnValues.name}`
-              case 'CandidateRemoved':
-                return `Candidate removed #${event.returnValues.candidateIndex}`
+              case 'WhitelistRemoved':
+                return `Whitelist removed ${formatAddress(event.returnValues.voter)}`
               case 'ElectionStarted':
                 return 'Election started'
               case 'ElectionEnded':
                 return 'Election ended'
               case 'VoteCast':
-                return `Vote cast: #${event.returnValues.candidateIndex}`
+                return `Vote cast: ${formatAddress(event.returnValues.voter)} -> choice #${event.returnValues.choiceIndex}`
               default:
                 return event.event || 'Event'
             }
@@ -113,72 +127,81 @@ function App() {
         .slice(0, 20)
 
       setEvents(formatted)
+      setEventWarning('')
     } catch (eventError) {
-      setError(eventError?.message || 'Failed to load events.')
+      setEvents([])
+      setEventWarning(eventError?.message || 'Failed to load events.')
     }
   }
 
   const loadContractState = async (activeContract, activeAccount) => {
-    const [contractOwner, activeFlag, startTime, endTime] = await Promise.all([
+    const [
+      contractOwner,
+      title,
+      activeFlag,
+      startTime,
+      endTime,
+      choiceCount,
+      whitelistCount,
+    ] = await Promise.all([
       activeContract.methods.owner().call(),
+      activeContract.methods.pollTitle().call(),
       activeContract.methods.electionActive().call(),
       activeContract.methods.electionStart().call(),
       activeContract.methods.electionEnd().call(),
+      activeContract.methods.choiceCount().call(),
+      activeContract.methods.whitelistCount().call(),
     ])
 
-    const count =
-      toNumberSafe(await activeContract.methods.candidateCount().call()) ?? 0
-    const loadedCandidates = []
+    const totalChoices = toNumberSafe(choiceCount) ?? 0
+    const totalWhitelist = toNumberSafe(whitelistCount) ?? 0
+    const loadedChoices = []
+    const loadedWhitelist = []
 
-    for (let i = 0; i < count; i += 1) {
-      const candidateInfo = await activeContract.methods.candidateInfo(i).call()
-      loadedCandidates.push({
+    for (let i = 0; i < totalChoices; i += 1) {
+      const choiceInfo = await activeContract.methods.choiceInfo(i).call()
+      loadedChoices.push({
         index: i,
-        name: candidateInfo.name,
-        votes: toNumberSafe(candidateInfo.votes) ?? 0,
-        active: candidateInfo.active,
+        label: choiceInfo.label,
+        votes: toNumberSafe(choiceInfo.votes) ?? 0,
       })
     }
 
-    let whitelistFlag = false
-    let votedFlag = false
-    let candidateIndex = null
-    let voteTimestamp = null
-
-    if (activeAccount) {
-      const statusInfo = await activeContract.methods
-        .voterStatus(activeAccount)
-        .call()
-      whitelistFlag = statusInfo[0]
-      votedFlag = statusInfo[1]
-      candidateIndex = votedFlag ? toNumberSafe(statusInfo[2]) : null
-      voteTimestamp = votedFlag ? toNumberSafe(statusInfo[3]) : null
+    for (let i = 0; i < totalWhitelist; i += 1) {
+      const entry = await activeContract.methods.whitelistEntry(i).call()
+      loadedWhitelist.push({
+        address: entry.voter,
+        active: entry.active,
+      })
     }
+
+    const statusInfo = activeAccount
+      ? await activeContract.methods.voterStatus(activeAccount).call()
+      : [false, false, 0, 0]
 
     const winnerInfo = await activeContract.methods.getWinner().call()
 
     setOwner(contractOwner)
+    setPollTitle(title)
     setElectionActive(Boolean(activeFlag))
     setElectionStart(toNumberSafe(startTime) || null)
     setElectionEnd(toNumberSafe(endTime) || null)
-    setIsWhitelisted(Boolean(whitelistFlag))
-    setHasVoted(Boolean(votedFlag))
-    setVotedCandidateIndex(candidateIndex)
-    setVotedAt(voteTimestamp)
-    setCandidates(loadedCandidates)
+    setChoices(loadedChoices)
+    setWhitelist(loadedWhitelist)
+    setIsWhitelisted(Boolean(statusInfo[0]))
+    setHasVoted(Boolean(statusInfo[1]))
+    setVotedChoiceIndex(toNumberSafe(statusInfo[2]))
+    setVotedAt(toNumberSafe(statusInfo[3]))
     setWinner({
       index: toNumberSafe(winnerInfo[0]) ?? 0,
-      name: winnerInfo[1],
+      label: winnerInfo[1],
       votes: toNumberSafe(winnerInfo[2]) ?? 0,
       hasTie: Boolean(winnerInfo[3]),
       hasWinner: Boolean(winnerInfo[4]),
     })
 
-    if (loadedCandidates.length > 0 && selectedCandidate === '') {
-      const firstActive = loadedCandidates.find((item) => item.active)
-      if (firstActive) {
-        setSelectedCandidate(String(firstActive.index))
-      }
+    if (loadedChoices.length > 0 && selectedChoiceIndex === '') {
+      setSelectedChoiceIndex(String(loadedChoices[0].index))
     }
   }
 
@@ -197,6 +220,10 @@ function App() {
       const instance = new Web3(window.ethereum)
       const [activeAccount] = await instance.eth.getAccounts()
       const activeNetworkId = await instance.eth.net.getId()
+      if (!deployedAddress) {
+        setError('No deployed contract address found for this network.')
+        return
+      }
       const contractInstance = new instance.eth.Contract(
         VotingArtifact.abi,
         deployedAddress,
@@ -206,11 +233,12 @@ function App() {
       setAccount(activeAccount || '')
       setNetworkId(activeNetworkId)
       setContract(contractInstance)
+      contractRef.current = contractInstance
 
       if (activeAccount) {
         await loadContractState(contractInstance, activeAccount)
       }
-      await loadEvents(contractInstance)
+      await loadEvents(contractInstance, instance)
     } catch (initError) {
       setError(initError?.message || 'Failed to connect wallet.')
     }
@@ -226,8 +254,8 @@ function App() {
     const handleAccountsChanged = async (accounts) => {
       const nextAccount = accounts?.[0] || ''
       setAccount(nextAccount)
-      if (contract) {
-        await loadContractState(contract, nextAccount)
+      if (contractRef.current) {
+        await loadContractState(contractRef.current, nextAccount)
       }
     }
 
@@ -240,7 +268,7 @@ function App() {
       window.ethereum.removeListener('accountsChanged', handleAccountsChanged)
       window.ethereum.removeListener('chainChanged', handleChainChanged)
     }
-  }, [deployedAddress, contract])
+  }, [deployedAddress])
 
   const handleConnect = async () => {
     await initWeb3(true)
@@ -269,125 +297,130 @@ function App() {
       return
     }
     await loadContractState(contract, account)
-    await loadEvents(contract)
+    await loadEvents(contract, web3)
   }
 
-  const handleWhitelist = async (event) => {
+  const handleSetPollTitle = async (event) => {
     event.preventDefault()
     if (!contract || !account) {
       setError('Connect your wallet first.')
       return
     }
 
-    if (!whitelistAddress) {
-      setError('Enter an address to whitelist.')
+    if (!pollTitleInput.trim()) {
+      setError('Enter a poll title.')
       return
     }
 
     setBusy(true)
     setError('')
-    setStatus('Whitelisting address...')
+    setStatus('Updating poll title...')
 
     try {
-      await contract.methods.whitelist(whitelistAddress).send({ from: account })
-      setWhitelistAddress('')
-      setStatus('Address whitelisted.')
+      await contract.methods
+        .setPollTitle(pollTitleInput.trim())
+        .send({ from: account })
+      setPollTitleInput('')
+      setStatus('Poll title updated.')
       await refresh()
     } catch (txError) {
-      setError(txError?.message || 'Whitelist transaction failed.')
+      setError(txError?.message || 'Set title failed.')
     } finally {
       setBusy(false)
     }
   }
 
-  const handleWhitelistBatch = async (event) => {
+  const handleSetChoices = async (event) => {
     event.preventDefault()
     if (!contract || !account) {
       setError('Connect your wallet first.')
       return
     }
 
-    const addresses = whitelistBatch
-      .split(/\s|,|;/)
+    const labels = choicesInput
+      .split(/\n|,|;/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+
+    if (labels.length === 0) {
+      setError('Enter at least one choice.')
+      return
+    }
+
+    setBusy(true)
+    setError('')
+    setStatus('Updating choices...')
+
+    try {
+      await contract.methods.setChoices(labels).send({ from: account })
+      setChoicesInput('')
+      setStatus('Choices updated.')
+      await refresh()
+    } catch (txError) {
+      setError(txError?.message || 'Set choices failed.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleSetWhitelist = async (event) => {
+    event.preventDefault()
+    if (!contract || !account) {
+      setError('Connect your wallet first.')
+      return
+    }
+
+    const addresses = whitelistInput
+      .split(/\n|,|;/)
       .map((value) => value.trim())
       .filter(Boolean)
 
     if (addresses.length === 0) {
-      setError('Paste at least one address.')
+      setError('Enter at least one address.')
       return
     }
 
     setBusy(true)
     setError('')
-    setStatus('Whitelisting batch...')
+    setStatus('Updating whitelist...')
 
     try {
-      await contract.methods.whitelistBatch(addresses).send({ from: account })
-      setWhitelistBatch('')
-      setStatus('Batch whitelist complete.')
+      await contract.methods.setWhitelist(addresses).send({ from: account })
+      setWhitelistInput('')
+      setStatus('Whitelist updated.')
       await refresh()
     } catch (txError) {
-      setError(txError?.message || 'Batch whitelist failed.')
+      setError(txError?.message || 'Set whitelist failed.')
     } finally {
       setBusy(false)
     }
   }
 
-  const handleAddCandidate = async (event) => {
+  const handleRemoveWhitelist = async (event) => {
     event.preventDefault()
     if (!contract || !account) {
       setError('Connect your wallet first.')
       return
     }
 
-    if (!newCandidateName.trim()) {
-      setError('Enter a candidate name.')
+    if (!removeWhitelistAddress) {
+      setError('Select an address to remove.')
       return
     }
 
     setBusy(true)
     setError('')
-    setStatus('Adding candidate...')
+    setStatus('Removing whitelist address...')
 
     try {
       await contract.methods
-        .addCandidate(newCandidateName.trim())
+        .removeFromWhitelist(removeWhitelistAddress)
         .send({ from: account })
-      setNewCandidateName('')
-      setStatus('Candidate added.')
+      setRemoveWhitelistAddress('')
+      setStatus('Whitelist address removed.')
       await refresh()
     } catch (txError) {
-      setError(txError?.message || 'Add candidate failed.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const handleRemoveCandidate = async (event) => {
-    event.preventDefault()
-    if (!contract || !account) {
-      setError('Connect your wallet first.')
-      return
-    }
-
-    if (removeCandidateId === '') {
-      setError('Select a candidate to remove.')
-      return
-    }
-
-    setBusy(true)
-    setError('')
-    setStatus('Removing candidate...')
-
-    try {
-      await contract.methods
-        .removeCandidate(toNumberSafe(removeCandidateId))
-        .send({ from: account })
-      setRemoveCandidateId('')
-      setStatus('Candidate removed.')
-      await refresh()
-    } catch (txError) {
-      setError(txError?.message || 'Remove candidate failed.')
+      setError(txError?.message || 'Remove whitelist failed.')
     } finally {
       setBusy(false)
     }
@@ -437,8 +470,8 @@ function App() {
       return
     }
 
-    if (selectedCandidate === '') {
-      setError('Pick a candidate before voting.')
+    if (selectedChoiceIndex === '') {
+      setError('Pick a choice before voting.')
       return
     }
 
@@ -448,7 +481,7 @@ function App() {
 
     try {
       await contract.methods
-        .vote(toNumberSafe(selectedCandidate))
+        .vote(toNumberSafe(selectedChoiceIndex))
         .send({ from: account })
       setStatus('Vote submitted.')
       await refresh()
@@ -462,11 +495,11 @@ function App() {
   const isOwner =
     owner && account && owner.toLowerCase() === account.toLowerCase()
 
-  const activeCandidates = candidates.filter((candidate) => candidate.active)
-  const votedCandidateName =
-    votedCandidateIndex !== null
-      ? candidates.find((item) => item.index === votedCandidateIndex)?.name ||
-        `#${votedCandidateIndex}`
+  const activeWhitelist = whitelist.filter((entry) => entry.active)
+  const votedChoiceLabel =
+    hasVoted && votedChoiceIndex !== null && votedChoiceIndex !== undefined
+      ? choices.find((choice) => choice.index === votedChoiceIndex)?.label ||
+        `#${votedChoiceIndex}`
       : ''
 
   const networkWarning =
@@ -508,66 +541,67 @@ function App() {
       )}
 
       <div className="admin-grid">
-        <form onSubmit={handleWhitelist} className="d-grid gap-2">
-          <label className="form-label">Whitelist Single Voter</label>
+        <form onSubmit={handleSetPollTitle} className="d-grid gap-2">
+          <label className="form-label">Poll Title</label>
           <input
             className="form-control"
-            placeholder="0x..."
-            value={whitelistAddress}
-            onChange={(event) => setWhitelistAddress(event.target.value)}
-            disabled={!isOwner}
+            placeholder="e.g. Favorite snack"
+            value={pollTitleInput}
+            onChange={(event) => setPollTitleInput(event.target.value)}
+            disabled={!isOwner || electionActive}
           />
-          <button className="btn btn-dark" type="submit" disabled={busy || !isOwner}>
-            Add Address
+          <button className="btn btn-primary" type="submit" disabled={busy || !isOwner || electionActive}>
+            Set Title
           </button>
         </form>
 
-        <form onSubmit={handleWhitelistBatch} className="d-grid gap-2">
-          <label className="form-label">Whitelist Batch</label>
+        <form onSubmit={handleSetChoices} className="d-grid gap-2">
+          <label className="form-label">Choices</label>
           <textarea
             className="form-control"
             rows="4"
-            placeholder="Paste addresses separated by space or comma"
-            value={whitelistBatch}
-            onChange={(event) => setWhitelistBatch(event.target.value)}
-            disabled={!isOwner}
+            placeholder="One choice per line"
+            value={choicesInput}
+            onChange={(event) => setChoicesInput(event.target.value)}
+            disabled={!isOwner || electionActive}
           />
-          <button className="btn btn-outline-dark" type="submit" disabled={busy || !isOwner}>
-            Import Batch
+          <button className="btn btn-outline-dark" type="submit" disabled={busy || !isOwner || electionActive}>
+            Set Choices
           </button>
         </form>
 
-        <form onSubmit={handleAddCandidate} className="d-grid gap-2">
-          <label className="form-label">Add Candidate</label>
-          <input
+        <form onSubmit={handleSetWhitelist} className="d-grid gap-2">
+          <label className="form-label">Whitelisted Addresses</label>
+          <textarea
             className="form-control"
-            placeholder="Candidate name"
-            value={newCandidateName}
-            onChange={(event) => setNewCandidateName(event.target.value)}
-            disabled={!isOwner}
+            rows="4"
+            placeholder="One address per line"
+            value={whitelistInput}
+            onChange={(event) => setWhitelistInput(event.target.value)}
+            disabled={!isOwner || electionActive}
           />
-          <button className="btn btn-primary" type="submit" disabled={busy || !isOwner}>
-            Add Candidate
+          <button className="btn btn-outline-dark" type="submit" disabled={busy || !isOwner || electionActive}>
+            Set Whitelist
           </button>
         </form>
 
-        <form onSubmit={handleRemoveCandidate} className="d-grid gap-2">
-          <label className="form-label">Remove Candidate</label>
+        <form onSubmit={handleRemoveWhitelist} className="d-grid gap-2">
+          <label className="form-label">Remove Whitelisted Address</label>
           <select
             className="form-select"
-            value={removeCandidateId}
-            onChange={(event) => setRemoveCandidateId(event.target.value)}
-            disabled={!isOwner}
+            value={removeWhitelistAddress}
+            onChange={(event) => setRemoveWhitelistAddress(event.target.value)}
+            disabled={!isOwner || electionActive}
           >
-            <option value="">Select candidate</option>
-            {activeCandidates.map((candidate) => (
-              <option key={`remove-${candidate.index}`} value={candidate.index}>
-                {candidate.name}
+            <option value="">Select address</option>
+            {activeWhitelist.map((entry) => (
+              <option key={`remove-${entry.address}`} value={entry.address}>
+                {entry.address}
               </option>
             ))}
           </select>
-          <button className="btn btn-outline-danger" type="submit" disabled={busy || !isOwner}>
-            Remove Candidate
+          <button className="btn btn-outline-danger" type="submit" disabled={busy || !isOwner || electionActive}>
+            Remove Address
           </button>
         </form>
       </div>
@@ -579,16 +613,16 @@ function App() {
       <h2 className="section-title">Cast Your Vote</h2>
       <div className="d-grid gap-3">
         <div>
-          <label className="form-label">Candidate</label>
+          <label className="form-label">Choice</label>
           <select
             className="form-select"
-            value={selectedCandidate}
-            onChange={(event) => setSelectedCandidate(event.target.value)}
-            disabled={activeCandidates.length === 0}
+            value={selectedChoiceIndex}
+            onChange={(event) => setSelectedChoiceIndex(event.target.value)}
+            disabled={choices.length === 0}
           >
-            {activeCandidates.map((candidate) => (
-              <option key={`vote-${candidate.index}`} value={candidate.index}>
-                {candidate.name}
+            {choices.map((choice) => (
+              <option key={`choice-${choice.index}`} value={choice.index}>
+                {choice.label}
               </option>
             ))}
           </select>
@@ -601,7 +635,7 @@ function App() {
             !isWhitelisted ||
             hasVoted ||
             !electionActive ||
-            activeCandidates.length === 0
+            choices.length === 0
           }
         >
           {hasVoted ? 'Vote Recorded' : 'Submit Vote'}
@@ -613,7 +647,7 @@ function App() {
         )}
         {!isWhitelisted && account && (
           <div className="text-muted small">
-            You must be whitelisted before voting.
+            Your wallet is not whitelisted.
           </div>
         )}
         {hasVoted && votedAt && (
@@ -622,80 +656,109 @@ function App() {
           </div>
         )}
       </div>
+      <div className="mt-4">
+        <h3 className="section-title">Whitelisted Addresses</h3>
+        <div className="table-responsive">
+          <table className="table table-striped align-middle">
+            <thead>
+              <tr>
+                <th>Address</th>
+                <th>Status</th>
+                <th className="text-end">Whitelisted</th>
+              </tr>
+            </thead>
+            <tbody>
+              {whitelist.map((entry) => (
+                <tr key={`whitelist-row-${entry.address}`}>
+                  <td>{entry.address}</td>
+                  <td>
+                    {entry.active ? (
+                      <span className="badge-pill badge-success">Active</span>
+                    ) : (
+                      <span className="badge-pill badge-muted">Removed</span>
+                    )}
+                  </td>
+                  <td className="text-end">
+                    {entry.active ? 'Yes' : 'No'}
+                  </td>
+                </tr>
+              ))}
+              {whitelist.length === 0 && (
+                <tr>
+                  <td colSpan="3" className="text-center text-muted">
+                    No addresses whitelisted yet.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </section>
   )
 
   const resultsPage = (
-    <div className="row g-4">
-      <div className="col-lg-7">
-        <section className="card-panel h-100">
-          <h2 className="section-title">Results</h2>
+    <div className="results-stack">
+      <section className="card-panel">
+        <h2 className="section-title">Results</h2>
           {winner?.hasWinner && (
-            <div className="winner-banner">
-              <div>
-                <div className="winner-label">Leading Candidate</div>
-                <div className="winner-name">{winner.name}</div>
-              </div>
-              <div className="winner-votes">{winner.votes} votes</div>
-              {winner.hasTie && (
-                <span className="badge-pill badge-warning">Tie</span>
-              )}
+          <div className="winner-banner">
+            <div>
+                <div className="winner-label">Leading Choice</div>
+                <div className="winner-name">{winner.label}</div>
             </div>
-          )}
-          <div className="table-responsive">
-            <table className="table table-striped align-middle">
-              <thead>
-                <tr>
-                  <th>Candidate</th>
-                  <th>Status</th>
-                  <th className="text-end">Votes</th>
-                </tr>
-              </thead>
-              <tbody>
-                {candidates.map((candidate) => (
-                  <tr key={`result-${candidate.index}`}>
-                    <td>{candidate.name}</td>
-                    <td>
-                      {candidate.active ? (
-                        <span className="badge-pill badge-success">Active</span>
-                      ) : (
-                        <span className="badge-pill badge-muted">Removed</span>
-                      )}
-                    </td>
-                    <td className="text-end">{candidate.votes}</td>
-                  </tr>
-                ))}
-                {candidates.length === 0 && (
-                  <tr>
-                    <td colSpan="3" className="text-center text-muted">
-                      No candidates loaded.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      </div>
-
-      <div className="col-lg-5">
-        <section className="card-panel h-100">
-          <h2 className="section-title">Activity Log</h2>
-          <div className="log-list">
-            {events.map((event) => (
-              <div key={event.id} className="log-item">
-                <div className="log-title">{event.summary}</div>
-                <div className="log-meta">
-                  Block {event.blockNumber} • {formatAddress(event.txHash)}
-                </div>
-              </div>
-            ))}
-            {events.length === 0 && (
-              <div className="text-muted">No events yet.</div>
+            <div className="winner-votes">{winner.votes} votes</div>
+            {winner.hasTie && (
+              <span className="badge-pill badge-warning">Tie</span>
             )}
           </div>
-        </section>
-      </div>
+        )}
+        <div className="table-responsive">
+          <table className="table table-striped align-middle">
+            <thead>
+              <tr>
+                <th>Choice</th>
+                <th className="text-end">Votes</th>
+              </tr>
+            </thead>
+            <tbody>
+                {choices.map((choice) => (
+                  <tr key={`result-${choice.index}`}>
+                    <td>{choice.label}</td>
+                    <td className="text-end">{choice.votes}</td>
+                  </tr>
+                ))}
+                {choices.length === 0 && (
+                <tr>
+                    <td colSpan="2" className="text-center text-muted">
+                      No choices loaded.
+                    </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="card-panel">
+        <h2 className="section-title">Activity Log</h2>
+        {eventWarning && (
+          <div className="alert alert-warning mb-3">{eventWarning}</div>
+        )}
+        <div className="log-list">
+          {events.map((event) => (
+            <div key={event.id} className="log-item">
+              <div className="log-title">{event.summary}</div>
+              <div className="log-meta">
+                Block {event.blockNumber} • {formatAddress(event.txHash)}
+              </div>
+            </div>
+          ))}
+          {events.length === 0 && (
+            <div className="text-muted">No events yet.</div>
+          )}
+        </div>
+      </section>
     </div>
   )
 
@@ -708,7 +771,9 @@ function App() {
             <span className={`badge-pill ${electionBadge}`}>{electionLabel}</span>
           </div>
           <p className="app-subtitle">
-            Full election console: admin controls, live results, and activity feed.
+            {pollTitle
+              ? `Poll: ${pollTitle}`
+              : 'Full election console: admin controls, live results, and activity feed.'}
           </p>
         </div>
         <div className="d-flex flex-column align-items-start align-items-lg-end gap-2">
@@ -779,11 +844,14 @@ function App() {
                     }`
                   : 'Connect wallet'}
               </span>
-              {hasVoted && (
+                {hasVoted && (
                 <span className="stat-helper">
-                  Voted for {votedCandidateName}
+                  Voted for {votedChoiceLabel}
                 </span>
               )}
+                {votedAt && !hasVoted && (
+                  <span className="stat-helper">Vote resets next election.</span>
+                )}
             </div>
           </div>
         </div>
