@@ -37,7 +37,7 @@ A local blockchain voting app with a Truffle smart contract and a React frontend
 
 1) Start Ganache and confirm:
    - RPC: http://127.0.0.1:7545
-   - Network ID: 5777
+   - Network ID: 5777 (or) 1337
 
 2) Add Ganache network to MetaMask:
    - Network name: Ganache 7545
